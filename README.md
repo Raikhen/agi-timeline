@@ -7,3 +7,4 @@ Interactive timeline documenting the important events and milestones in the path
 - Add more images to the events
 - Make sure that the events are what you'd wanna see
 - Add more sources to the events
+- Make it responsive
