@@ -11,9 +11,10 @@ file (not the code) is how you change the timeline's taste.
 1. **Run row.** Inserts an `ingestion_runs` row with `status = 'running'`. Whatever
    happens, the row is finalized as `succeeded` or `failed` with `events_added`,
    `events_considered`, and a structured `log` jsonb of every step.
-2. **Window.** Looks up the last *succeeded* run's `started_at` and rewinds a 7-day
-   overlap margin (so a missed event gets a second chance and idempotency does the
-   dedup). First run defaults to 21 days back.
+2. **Window.** Looks up the last *succeeded* run's `started_at` and rewinds a 1-day
+   overlap margin (catches posts published around the run boundary; idempotency does
+   the dedup). A wider margin re-sends already-processed posts every day, which was
+   the main API cost. First run defaults to 21 days back.
 3. **Gather (human-written material only).** Fetches Zvi Mowshowitz's Substack feed
    (`https://thezvi.substack.com/feed`) and the full content of every post in the
    window (from the feed's `content:encoded`, falling back to fetching the post URL).
@@ -27,7 +28,7 @@ file (not the code) is how you change the timeline's taste.
      instructions (selector/condenser, never an author; verbatim quotes only;
      honest 1–5 importance scoring; zero events is the expected outcome; merge
      instead of duplicate).
-   - The server-side `web_search` tool is enabled (max 8 searches) so the model can
+   - The server-side `web_search` tool is enabled (max 3 searches) at `medium` effort so the model can
      verify dates and locate primary sources.
    - Output arrives through a `submit_operations` tool call with a strict JSON schema:
      `adds` (full event objects per `docs/EVENT_SCHEMA.md`) and `amends`

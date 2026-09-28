@@ -45,13 +45,16 @@ const FEED_URLS = [
   "https://thezvi.wordpress.com/feed/",
 ];
 const FIRST_RUN_WINDOW_DAYS = 21;
-const OVERLAP_MARGIN_DAYS = 7;
+const OVERLAP_MARGIN_DAYS = 1; // posts before this were already sent to the model; re-sending them is the main cost
 const DEDUPE_CONTEXT_DAYS = 90;
 const MATERIAL_CHAR_CAP = 150_000;
 const PER_POST_CHAR_CAP = 60_000; // Zvi's weekly roundups run 90k+; keep breadth across posts
 const MODEL = "claude-sonnet-5"; // current best cost-effective model
+const EFFORT = "medium" as const;
+// Sonnet 5 $/MTok, for the per-run cost estimate in the log
+const PRICE = { input: 2, output: 10, cache_write: 2.5, cache_read: 0.2, per_search: 0.01 };
 const MAX_MODEL_ITERATIONS = 12;
-const MAX_WEB_SEARCHES = 8;
+const MAX_WEB_SEARCHES = 3; // each search result is re-read on every later model step
 const FETCH_TIMEOUT_MS = 45_000;
 const ANTHROPIC_TIMEOUT_MS = 10 * 60_000; // per-call
 const OVERALL_TIME_CAP_MS = 20 * 60_000; // hard cap; finalize gracefully after
@@ -566,6 +569,7 @@ async function fetchDedupeContext(supabase: SupabaseClient): Promise<DedupeConte
 interface ModelUsage {
   input_tokens: number;
   output_tokens: number;
+  cache_creation_input_tokens: number;
   cache_read_input_tokens: number;
   iterations: number;
   web_search_requests: number;
@@ -611,7 +615,7 @@ async function callClaude(
               tool_choice: { type: "tool" as const, name: "submit_operations" },
               thinking: { type: "disabled" as const },
             }
-          : {}),
+          : { output_config: { effort: EFFORT } }),
         messages: forced
           ? messages.map((m) =>
               Array.isArray(m.content)
@@ -633,6 +637,7 @@ async function callClaude(
     usage.iterations++;
     usage.input_tokens += response.usage.input_tokens;
     usage.output_tokens += response.usage.output_tokens;
+    usage.cache_creation_input_tokens += response.usage.cache_creation_input_tokens ?? 0;
     usage.cache_read_input_tokens += response.usage.cache_read_input_tokens ?? 0;
     usage.web_search_requests += response.usage.server_tool_use?.web_search_requests ?? 0;
 
@@ -661,11 +666,26 @@ async function callClaude(
       (b): b is Anthropic.ToolUseBlock => b.type === "tool_use" && b.name === "submit_operations",
     );
     if (submit) {
-      const ops = submit.input as Operations;
+      const input = submit.input as Record<string, unknown>;
+      // Large nested inputs sometimes arrive with arrays JSON-encoded as strings;
+      // decode them instead of silently dropping the model's work.
+      const asArray = (key: string): unknown[] => {
+        let v = input[key];
+        if (typeof v === "string") {
+          try {
+            v = JSON.parse(v);
+          } catch {
+            // fall through to the shape check below
+          }
+        }
+        if (Array.isArray(v)) return v;
+        log("model.submit_malformed", { field: key, type: typeof input[key], preview: String(input[key]).slice(0, 300) });
+        return [];
+      };
       return {
-        adds: Array.isArray(ops.adds) ? ops.adds : [],
-        amends: Array.isArray(ops.amends) ? ops.amends : [],
-        notes: typeof ops.notes === "string" ? ops.notes : "",
+        adds: asArray("adds") as Operations["adds"],
+        amends: asArray("amends") as Operations["amends"],
+        notes: typeof input.notes === "string" ? input.notes : "",
       };
     }
 
@@ -1001,6 +1021,7 @@ async function main(): Promise<number> {
   const usage: ModelUsage = {
     input_tokens: 0,
     output_tokens: 0,
+    cache_creation_input_tokens: 0,
     cache_read_input_tokens: 0,
     iterations: 0,
     web_search_requests: 0,
@@ -1055,7 +1076,13 @@ async function main(): Promise<number> {
     } else {
       ops = await callClaude(systemPrompt, userPrompt, material.allowedUrls, usage);
     }
-    log("model.usage", { ...usage });
+    const estCostUsd =
+      (usage.input_tokens * PRICE.input +
+        usage.output_tokens * PRICE.output +
+        usage.cache_creation_input_tokens * PRICE.cache_write +
+        usage.cache_read_input_tokens * PRICE.cache_read) / 1e6 +
+      usage.web_search_requests * PRICE.per_search;
+    log("model.usage", { ...usage, est_cost_usd: Math.round(estCostUsd * 100) / 100 });
 
     if (!ops) {
       log("model.no_operations", { note: "no submission captured; finalizing with zero events" });
