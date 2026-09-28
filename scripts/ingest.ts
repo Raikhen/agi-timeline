@@ -46,6 +46,9 @@ const argDate = (name: string): Date | null => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new Error(`--${name} must be YYYY-MM-DD, got "${v}"`);
   return new Date(`${v}T00:00:00Z`);
 };
+const KNOWN_FLAGS = /^--(dry-run|no-llm|since=.*|until=.*)$/;
+const badArgs = process.argv.slice(2).filter((a) => !KNOWN_FLAGS.test(a));
+if (badArgs.length) throw new Error(`Unrecognized arguments: ${badArgs.join(" ")}`);
 const SINCE = argDate("since");
 const UNTIL = argDate("until"); // exclusive bound is the day after
 const WINDOW_END = UNTIL ? new Date(UNTIL.getTime() + 86_400_000) : null;
