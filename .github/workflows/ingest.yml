@@ -4,6 +4,13 @@ on:
   schedule:
     - cron: "17 7 * * *" # daily 07:17 UTC
   workflow_dispatch:
+    inputs:
+      since:
+        description: "Backfill start date YYYY-MM-DD (blank = normal daily window)"
+        required: false
+      until:
+        description: "Backfill end date YYYY-MM-DD, inclusive (blank = today)"
+        required: false
 
 concurrency:
   group: ingest
@@ -22,8 +29,10 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Run ingestion pipeline
-        run: bun run scripts/ingest.ts
+        run: bun run scripts/ingest.ts ${SINCE:+--since=$SINCE} ${UNTIL:+--until=$UNTIL}
         env:
+          SINCE: ${{ inputs.since }}
+          UNTIL: ${{ inputs.until }}
           NEXT_PUBLIC_SUPABASE_URL: https://zwlvzmiaztipazoavssm.supabase.co
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

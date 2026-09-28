@@ -38,6 +38,19 @@ import {
 const DRY_RUN = process.argv.includes("--dry-run");
 const NO_LLM = process.argv.includes("--no-llm"); // implies no writes
 const WRITE_MODE = !DRY_RUN && !NO_LLM;
+// Backfill: --since=YYYY-MM-DD [--until=YYYY-MM-DD] (inclusive) replaces the
+// automatic window, e.g. to cover days when the daily run was failing.
+const argDate = (name: string): Date | null => {
+  const v = process.argv.find((a) => a.startsWith(`--${name}=`))?.split("=")[1];
+  if (!v) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new Error(`--${name} must be YYYY-MM-DD, got "${v}"`);
+  return new Date(`${v}T00:00:00Z`);
+};
+const SINCE = argDate("since");
+const UNTIL = argDate("until"); // exclusive bound is the day after
+const WINDOW_END = UNTIL ? new Date(UNTIL.getTime() + 86_400_000) : null;
+const BACKFILL_FEED = "https://thezvi.wordpress.com/feed/"; // pages via ?paged=N; Substack's feed doesn't
+const MAX_FEED_PAGES = 10;
 
 // Same posts on both; Substack (Cloudflare) 403s GitHub Actions runner IPs, WordPress.com doesn't
 const FEED_URLS = [
@@ -433,6 +446,14 @@ interface GatheredMaterial {
 }
 
 async function determineWindow(supabase: SupabaseClient): Promise<Date> {
+  if (SINCE) {
+    log("window.determined", {
+      backfill: true,
+      window_start: SINCE.toISOString(),
+      window_end: WINDOW_END?.toISOString() ?? null,
+    });
+    return SINCE;
+  }
   const { data, error } = await supabase
     .from("ingestion_runs")
     .select("started_at")
@@ -460,7 +481,24 @@ async function gatherMaterial(windowStart: Date): Promise<GatheredMaterial> {
 
   let feedXml: string | null = null;
   const feedStatuses: string[] = [];
-  for (const url of FEED_URLS) {
+  let feedItems: FeedItem[] = [];
+  if (SINCE) {
+    // Backfill: walk the paged WordPress feed back past the window start.
+    for (let page = 1; page <= MAX_FEED_PAGES; page++) {
+      const url = page === 1 ? BACKFILL_FEED : `${BACKFILL_FEED}?paged=${page}`;
+      const res = await fetchWithRetry(url);
+      if (!res.ok) {
+        log("gather.feed_fetch_failed", { url, status: res.status });
+        break;
+      }
+      const pageItems = parseFeed(await res.text());
+      feedItems.push(...pageItems);
+      log("gather.feed_page", { url, items: pageItems.length });
+      if (pageItems.length === 0 || pageItems.some((i) => i.pubDate < windowStart)) break;
+    }
+    if (feedItems.length === 0) throw new Error("Backfill feed fetch returned no items");
+  }
+  for (const url of SINCE ? [] : FEED_URLS) {
     const feedRes = await fetchWithRetry(url);
     if (feedRes.ok) {
       feedXml = await feedRes.text();
@@ -470,11 +508,14 @@ async function gatherMaterial(windowStart: Date): Promise<GatheredMaterial> {
     feedStatuses.push(`${url}: HTTP ${feedRes.status}`);
     log("gather.feed_fetch_failed", { url, status: feedRes.status });
   }
-  if (feedXml === null) throw new Error(`All feed fetches failed: ${feedStatuses.join("; ")}`);
-  const items = parseFeed(feedXml)
-    .filter((i) => i.pubDate >= windowStart)
+  if (!SINCE) {
+    if (feedXml === null) throw new Error(`All feed fetches failed: ${feedStatuses.join("; ")}`);
+    feedItems = parseFeed(feedXml);
+  }
+  const items = feedItems
+    .filter((i) => i.pubDate >= windowStart && (!WINDOW_END || i.pubDate < WINDOW_END))
     .sort((a, b) => b.pubDate.getTime() - a.pubDate.getTime()); // newest first
-  log("gather.feed", { items_in_feed: parseFeed(feedXml).length, items_in_window: items.length });
+  log("gather.feed", { items_in_feed: feedItems.length, items_in_window: items.length });
 
   const sections: string[] = [];
   let total = 0;
@@ -760,11 +801,19 @@ function vetOperations(
     const reasons: string[] = [];
     const slug = typeof raw?.slug === "string" ? raw.slug : "(missing slug)";
 
+    // A title a few chars over the limit shouldn't cost the whole event.
+    let title = raw.title;
+    if (typeof title === "string" && title.length > 80) {
+      const cut = title.slice(0, 80);
+      title = cut.slice(0, cut.lastIndexOf(" ") > 50 ? cut.lastIndexOf(" ") : 80).replace(/[\s,;:–—-]+$/, "");
+      log("vet.title_shortened", { slug, from: raw.title, to: title });
+    }
+
     const candidate: TimelineEvent = {
       slug: raw.slug,
       date: raw.date,
       date_precision: raw.date_precision as TimelineEvent["date_precision"],
-      title: raw.title,
+      title,
       summary: raw.summary,
       category: raw.category as TimelineEvent["category"],
       secondary_category: (raw.secondary_category ?? null) as TimelineEvent["secondary_category"],
