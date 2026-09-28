@@ -28,7 +28,12 @@ interface Segment {
 }
 
 const T_MIN = Date.UTC(1943, 0, 1);
-const T_MAX = Date.UTC(2026, 8, 15);
+// End of today (UTC): the ingest adds events daily, and anything past T_MAX is
+// clamped onto the edge. Layout only runs client-side, so no hydration skew.
+const T_MAX = (() => {
+  const d = new Date();
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
+})();
 const YEAR_MS = 365.25 * 24 * 3600 * 1000;
 
 /**
