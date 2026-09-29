@@ -52,8 +52,9 @@ if (badArgs.length) throw new Error(`Unrecognized arguments: ${badArgs.join(" ")
 const SINCE = argDate("since");
 const UNTIL = argDate("until"); // exclusive bound is the day after
 const WINDOW_END = UNTIL ? new Date(UNTIL.getTime() + 86_400_000) : null;
-const BACKFILL_FEED = "https://thezvi.wordpress.com/feed/"; // pages via ?paged=N; Substack's feed doesn't
-const MAX_FEED_PAGES = 10;
+// Backfills use WordPress.com's posts API: it filters by date server-side, whereas
+// the paged RSS feed was flaky (empty or inconsistent pages from the Actions runner).
+const BACKFILL_API = "https://public-api.wordpress.com/rest/v1.1/sites/thezvi.wordpress.com/posts/";
 
 // Same posts on both; Substack (Cloudflare) 403s GitHub Actions runner IPs, WordPress.com doesn't
 const FEED_URLS = [
@@ -314,6 +315,9 @@ const REACTION_SCHEMA = {
 
 const SUBMIT_OPERATIONS_TOOL = {
   name: "submit_operations",
+  // Enforce the schema server-side: without it, large submissions sometimes
+  // arrived with arrays missing or JSON-encoded as unparseable strings.
+  strict: true,
   description:
     "Submit your final timeline operations. Call exactly once. Empty adds/amends arrays are the expected output for most runs.",
   input_schema: {
@@ -486,20 +490,21 @@ async function gatherMaterial(windowStart: Date): Promise<GatheredMaterial> {
   const feedStatuses: string[] = [];
   let feedItems: FeedItem[] = [];
   if (SINCE) {
-    // Backfill: walk the paged WordPress feed back past the window start.
-    for (let page = 1; page <= MAX_FEED_PAGES; page++) {
-      const url = page === 1 ? BACKFILL_FEED : `${BACKFILL_FEED}?paged=${page}`;
-      const res = await fetchWithRetry(url);
-      if (!res.ok) {
-        log("gather.feed_fetch_failed", { url, status: res.status });
-        break;
-      }
-      const pageItems = parseFeed(await res.text());
-      feedItems.push(...pageItems);
-      log("gather.feed_page", { url, items: pageItems.length });
-      if (pageItems.length === 0 || pageItems.some((i) => i.pubDate < windowStart)) break;
-    }
-    if (feedItems.length === 0) throw new Error("Backfill feed fetch returned no items");
+    const url =
+      `${BACKFILL_API}?number=100&fields=date,title,URL,content` +
+      `&after=${windowStart.toISOString()}` +
+      (WINDOW_END ? `&before=${WINDOW_END.toISOString()}` : "");
+    const res = await fetchWithRetry(url);
+    if (!res.ok) throw new Error(`Backfill posts API: HTTP ${res.status}`);
+    const body = (await res.json()) as { posts: { date: string; title: string; URL: string; content: string }[] };
+    feedItems = body.posts.map((p) => ({
+      title: htmlToReadableText(p.title).trim(),
+      link: p.URL,
+      pubDate: new Date(p.date),
+      contentHtml: p.content,
+    }));
+    log("gather.backfill_api", { url, posts: feedItems.length });
+    if (feedItems.length === 0) log("gather.backfill_empty", { note: "no posts in backfill window" });
   }
   for (const url of SINCE ? [] : FEED_URLS) {
     const feedRes = await fetchWithRetry(url);
@@ -812,12 +817,27 @@ function vetOperations(
       log("vet.title_shortened", { slug, from: raw.title, to: title });
     }
 
+    // Same for a summary just over 600 chars: drop trailing sentences to fit.
+    let summary = raw.summary;
+    if (typeof summary === "string" && summary.length > 600) {
+      const sentences = summary.match(/[^.!?]+[.!?]+(\s+|$)/g) ?? [];
+      let fitted = "";
+      for (const sent of sentences) {
+        if ((fitted + sent).trim().length > 600) break;
+        fitted += sent;
+      }
+      if (fitted.trim().length >= 150) {
+        log("vet.summary_shortened", { slug, from_chars: summary.length, to_chars: fitted.trim().length });
+        summary = fitted.trim();
+      }
+    }
+
     const candidate: TimelineEvent = {
       slug: raw.slug,
       date: raw.date,
       date_precision: raw.date_precision as TimelineEvent["date_precision"],
       title,
-      summary: raw.summary,
+      summary,
       category: raw.category as TimelineEvent["category"],
       secondary_category: (raw.secondary_category ?? null) as TimelineEvent["secondary_category"],
       importance: raw.importance,
