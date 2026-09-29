@@ -813,7 +813,10 @@ function vetOperations(
     let title = raw.title;
     if (typeof title === "string" && title.length > 80) {
       const cut = title.slice(0, 80);
-      title = cut.slice(0, cut.lastIndexOf(" ") > 50 ? cut.lastIndexOf(" ") : 80).replace(/[\s,;:–—-]+$/, "");
+      title = cut.slice(0, cut.lastIndexOf(" ") > 50 ? cut.lastIndexOf(" ") : 80);
+      // Don't leave a quote opened and cut off ("... in 'An Alien"), or a dangling connective.
+      title = title.replace(/\s+['"‘“][^'"’”]*$/, "");
+      title = title.replace(/(\s+(in|of|on|at|to|for|and|with|the|a|an|as|by))+$/i, "").replace(/[\s,;:–—-]+$/, "");
       log("vet.title_shortened", { slug, from: raw.title, to: title });
     }
 
